@@ -20,6 +20,7 @@ namespace SMBLibrary.Client
 {
     public class SMB2Client : ISMBClient
     {
+        public static readonly bool SupportMultiRequests = true;
         public static readonly int NetBiosOverTCPPort = 139;
         public static readonly int DirectTCPPort = 445;
 
@@ -533,10 +534,14 @@ namespace SMBLibrary.Client
                     messageBytes = packet.Trailer;
                 }
 
-                SMB2Command command;
+                // A server reply to a compound (chained) request is itself a chain of SMB2 messages in one frame, linked via Header.NextCommand - same as request.
+                // The original code called SMB2Command.ReadResponse() once and only every recovered the FIRST message in the chain, silently discarding ever other chained response.
+                // Parse the full chain instead, and apply the same per-message bookkeeping )credit accounting, negotiate capability detection, MessageID/signature validation,
+                // and queueing) to each message that the original code applied to the lone message.
+                List<SMB2Command> commands;
                 try
                 {
-                    command = SMB2Command.ReadResponse(messageBytes, 0);
+                    commands = SMB2Command.ReadResponseChain(messageBytes, 0);
                 }
                 catch (Exception ex)
                 {
@@ -547,14 +552,25 @@ namespace SMBLibrary.Client
                     return;
                 }
 
-                if (m_preauthIntegrityHashValue != null && (command is NegotiateResponse || (command is SessionSetupResponse sessionSetupResponse && sessionSetupResponse.Header.Status == NTStatus.STATUS_MORE_PROCESSING_REQUIRED)))
+                if (m_preauthIntegrityHashValue != null && commands.Count > 0)
                 {
-                    m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, messageBytes));
+                    SMB2Command firstCommand = commands[0];
+                    if (firstCommand is NegotiateResponse || (firstCommand is SessionSetupResponse sessionSetupResponse && sessionSetupResponse.Header.Status == NTStatus.STATUS_MORE_PROCESSING_REQUIRED))
+                    {
+                        // Preauth integrity hashing covers the whole received message, not a sub-range - NegotiateResponse / SessionSetupRsponse
+                        // are never chained with other commands in practice, so hashing the entries frame once here matches the original behavior.
+                        m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, messageBytes));
+                    }
                 }
 
-                m_availableCredits += command.Header.Credits;
+                // Credit grants and the negotiate capability check apply once per received message, not once per chained command - a compounded reply's cumulative credit grant is
+                // carried by the exchange as a whole (the original single command code applied this exactly once, to the only command it ever saw). Summing every chained command's
+                // Header.Credits here would make the client believe it holds more credit than the server actually granted, which a real server can treat as a flow-control protocol
+                // violation and respond to by dropping the connection. Use the LAST command in the chain, matching how a non-compounded (single-command) frame behaves.
+                SMB2Command lastCommand = commands[commands.Count - 1];
+                m_availableCredits += lastCommand.Header.Credits;
 
-                if (m_transport == SMBTransportType.DirectTCPTransport && command is NegotiateResponse negotiateResponse)
+                if (m_transport == SMBTransportType.DirectTCPTransport && lastCommand is NegotiateResponse negotiateResponse)
                 {
                     m_connectionSupportsMultiCredit = (negotiateResponse.Capabilities & Capabilities.LargeMTU) > 0;
                     if (m_connectionSupportsMultiCredit)
@@ -572,26 +588,38 @@ namespace SMBLibrary.Client
                     }
                 }
 
-                // [MS-SMB2] 3.2.5.1.2 - If the MessageId is 0xFFFFFFFFFFFFFFFF, this is not a reply to a previous request,
-                // and the client MUST NOT attempt to locate the request, but instead process it as follows:
-                // If the command field in the SMB2 header is SMB2 OPLOCK_BREAK, it MUST be processed as specified in 3.2.5.19.
-                // Otherwise, the response MUST be discarded as invalid.
-                if (command.Header.MessageID != 0xFFFFFFFFFFFFFFFF || command.Header.Command == SMB2CommandName.OplockBreak)
+                int commandOffset = 0;
+                foreach (SMB2Command command in commands)
                 {
-                    bool isInterimResponse = ((command.Header.Flags & SMB2PacketHeaderFlags.AsyncCommand) != 0) && command.Header.Status == NTStatus.STATUS_PENDING;
-                    bool shouldBeSigned = m_isLoggedIn && m_signingRequired && !isEncrypted && !isInterimResponse;
-
-                    // [MS-SMB2] 3.2.5.1.3 If signature verification fails, the client MUST discard the received message. The client MAY also choose to disconnect the connection
-                    if (shouldBeSigned && !SMB2Cryptography.VerifySignature(messageBytes, m_dialect, m_signingKey))
+                    int commandLength = (command.Header.NextCommand != 0) ? (int)command.Header.NextCommand : (messageBytes.Length - commandOffset);
+                    // [MS-SMB2] 3.2.5.1.2 - If the MessageId is 0xFFFFFFFFFFFFFFFF, this is not a reply to a previous request,
+                    // and the client MUST NOT attempt to locate the request, but instead process it as follows:
+                    // If the command field in the SMB2 header is SMB2 OPLOCK_BREAK, it MUST be processed as specified in 3.2.5.19.
+                    // Otherwise, the response MUST be discarded as invalid.
+                    if (command.Header.MessageID != 0xFFFFFFFFFFFFFFFF || command.Header.Command == SMB2CommandName.OplockBreak)
                     {
-                        Log("Invalid SMB2 response signature");
-                        return;
-                    }
+                        bool isInterimResponse = ((command.Header.Flags & SMB2PacketHeaderFlags.AsyncCommand) != 0) && command.Header.Status == NTStatus.STATUS_PENDING;
+                        bool shouldBeSigned = m_isLoggedIn && m_signingRequired && !isEncrypted && !isInterimResponse;
 
-                    lock (m_incomingQueueLock)
-                    {
-                        m_incomingQueue.Add(command);
-                        m_incomingQueueEventHandle.Set();
+                        // [MS-SMB2] 3.2.5.1.3 If signature verification fails, the client MUST discard the received message. The client MAY also choose to disconnect the connection
+                        // Each chained message is sined independently over its own segment, so verify against that segment (commandOffset...commandLength), not the whole frame.
+                        if (shouldBeSigned)
+                        {
+                            byte[] commandBytes = ByteReader.ReadBytes(messageBytes, commandOffset, commandLength);
+                            if (!SMB2Cryptography.VerifySignature(commandBytes, m_dialect, m_signingKey))
+                            {
+                                Log("Invalid SMB2 response signature");
+                                return;
+                            }
+                        }
+
+                        lock (m_incomingQueueLock)
+                        {
+                            m_incomingQueue.Add(command);
+                            m_incomingQueueEventHandle.Set();
+                        }
+
+                        commandOffset += commandLength;
                     }
                 }
             }
