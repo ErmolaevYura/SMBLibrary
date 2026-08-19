@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+    <Platforms>AnyCPU;Net</Platforms>
     <AssemblyName>SMBLibrary</AssemblyName>
     <Version>1.5.7.1</Version>
     <NoWarn>1573;1591</NoWarn>
@@ -14,6 +14,14 @@
     <PackageProjectUrl>https://github.com/TalAloni/SMBLibrary</PackageProjectUrl>
     <RepositoryUrl>https://github.com/TalAloni/SMBLibrary</RepositoryUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)' == 'Net'">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' != 'Net'">
+    <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
 
   <ItemGroup>
@@ -32,8 +40,11 @@
     </AssemblyAttribute>
   </ItemGroup>
 
-  <Target Name="ILRepack" Condition="'$(Configuration)' == 'Release'" AfterTargets="AfterBuild">
-    <Exec Command="&quot;$(ProgramW6432)\ILRepack\ILRepack.exe&quot; /out=&quot;$(OutputPath)\SMBLibrary.dll&quot; &quot;$(OutputPath)\SMBLibrary.dll&quot; &quot;$(OutputPath)\Utilities.dll&quot;"></Exec>
+  <Target Name="ILRepack" Condition="'$(Configuration)' == 'Release' and '$(Platform)' == 'Net'" AfterTargets="AfterBuild">
+    <Exec Command="&quot;$(ProgramW6432)\ILRepack\ILRepack.exe&quot; /out=&quot;$(OutputPath)SMBLibrary.dll&quot; &quot;$(OutputPath)SMBLibrary.dll&quot; &quot;$(OutputPath)Utilities.dll&quot;"></Exec>
+  </Target>
+  <Target Name="ILRepack" Condition="'$(Configuration)' == 'Release' and '$(Platform)' != 'Net'" AfterTargets="AfterBuild">
+    <Exec Command="&quot;ilrepack.exe&quot; /out=&quot;$(TargetDir)SMBLibrary.dll&quot; &quot;$(TargetDir)SMBLibrary.dll&quot; &quot;$(TargetDir)Utilities.dll&quot;"></Exec>
   </Target>
 
 </Project>

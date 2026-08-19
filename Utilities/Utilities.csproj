@@ -1,10 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+    <Platforms>AnyCPU;Net</Platforms>
     <AssemblyName>Utilities</AssemblyName>
     <RootNamespace>Utilities</RootNamespace>
     <Copyright>Copyright © Tal Aloni 2005-2023</Copyright>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)' == 'Net'">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' != 'Net'">
+    <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
 
 </Project>
