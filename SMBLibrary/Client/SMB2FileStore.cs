@@ -343,6 +343,19 @@ namespace SMBLibrary.Client
             return connectionTerminated ? NTStatus.STATUS_INVALID_SMB : NTStatus.STATUS_IO_TIMEOUT;
         }
 
+        public void TrySendPacket(List<SMB2Command> commands)
+        {
+            if (!m_client.IsConnected)
+            {
+                throw new InvalidOperationException("The client is no longer connected");
+            }
+            foreach (var command in commands)
+            {
+                command.Header.TreeID = m_treeID;
+            }
+            m_client.TrySendCommands(commands, m_encryptShareData, increaseMessageId: false);
+        }   
+
         public NTStatus Disconnect()
         {
             TreeDisconnectRequest request = new TreeDisconnectRequest();

@@ -640,7 +640,7 @@ namespace SMBLibrary.Client
             }
         }
 
-        internal SMB2Command WaitForCommand(ulong messageID)
+        public SMB2Command WaitForCommand(ulong messageID)
         {
             return WaitForCommand(messageID, out bool _);
         }
@@ -706,66 +706,73 @@ namespace SMBLibrary.Client
 
         internal void TrySendCommand(SMB2Command request, bool encryptData)
         {
-            if (!m_connectionSupportsMultiCredit && request.Header.CreditCharge > 1)
-            {
-                throw new Exception("Attempted to read or write more data than allowed for this connection");
-            }
+            request.Header.MessageID = m_messageID;
+            TrySendCommands(new List<SMB2Command>(){ request }, encryptData);
+        }
 
-            if (!m_connectionSupportsMultiCredit)
+        internal void TrySendCommands(List<SMB2Command> requests, bool encryptData, bool increaseMessageId = true)
+        {
+            if (requests == null || requests.Count == 0)
+                return;
+
+            ushort totalCreditCharge = 0;
+            // 1. Validate and calculate credit charge for EVERY command in the batch
+            foreach (var request in requests)
             {
-                // [MS-SMB2] 3.2.4.1.5 If [..] Connection.SupportsMultiCredit is FALSE, CreditCharge SHOULD be set to 0.
-                request.Header.CreditCharge = 0;
-                request.Header.Credits = 1;
-                m_availableCredits -= 1;
-            }
-            else
-            {
-                if (request.Header.CreditCharge == 0)
+                // [MS-SMB2] If the client encrypts the message [..] then the client MUST set the Signature field of the SMB2 header to zero
+                var isSigned = m_signingRequired && !encryptData && m_sessionID != 0 &&
+                    ((request.CommandName == SMB2CommandName.TreeConnect || request.Header.TreeID != 0) ||
+                    (m_dialect >= SMB2Dialect.SMB300 && request.CommandName == SMB2CommandName.Logoff));
+
+                request.Header.IsSigned = isSigned;
+                request.Header.SessionID = m_sessionID;
+
+                if (!m_connectionSupportsMultiCredit)
+                {
+                    if (request.Header.CreditCharge > 1)
+                    {
+                        throw new Exception("Attempted to read or write more data than allowed for this connection");
+                    }
+                    // [MS-SMB2] 3.2.4.1.5 If [..] Connection.SupportsMultiCredit is FALSE, CreditCharge SHOULD be set to 0.
+                    request.Header.CreditCharge = 0;
+                    request.Header.Credits = 1;
+                    // MessageID allocation when MultiCredit is false is strictly 1 per command
+                    totalCreditCharge += 1;
+                }
+                else
                 {
                     // [MS-SMB2] 3.2.4.1.5 If Connection.SupportsMultiCredit is TRUE:
-                    // For READ, WRITE, IOCTL, and QUERY_DIRECTORY requests, CreditCharge field in the SMB2 header SHOULD be set to [..] the value computed.
-                    // For all other requests, the client MUST set CreditCharge to 1.
-                    request.Header.CreditCharge = 1;
-                }
-
-                if (m_availableCredits < request.Header.CreditCharge)
-                {
-                    throw new Exception("Not enough credits");
-                }
-
-                m_availableCredits -= request.Header.CreditCharge;
-
-                if (m_availableCredits < DesiredCredits)
-                {
-                    request.Header.Credits += (ushort)(DesiredCredits - m_availableCredits);
+                    if (request.Header.CreditCharge == 0)
+                    {
+                        // For READ, WRITE, IOCTL, and QUERY_DIRECTORY requests, CreditCharge field in the SMB2 header SHOULD be set to [..] the value computed.
+                        // For all other requests, the client MUST set CreditCharge to 1.
+                        request.Header.CreditCharge = 1;
+                    }
+                    totalCreditCharge += request.Header.CreditCharge;
                 }
             }
 
-            request.Header.MessageID = m_messageID;
-            request.Header.SessionID = m_sessionID;
-            // [MS-SMB2] If the client encrypts the message [..] then the client MUST set the Signature field of the SMB2 header to zero
-            if (m_signingRequired && !encryptData)
+            // 2. Check internal credit window availability for the ENTIRE batch
+            if (m_availableCredits < totalCreditCharge)
             {
-                request.Header.IsSigned = (m_sessionID != 0 && ((request.CommandName == SMB2CommandName.TreeConnect || request.Header.TreeID != 0) ||
-                                                                (m_dialect >= SMB2Dialect.SMB300 && request.CommandName == SMB2CommandName.Logoff)));
-                if (request.Header.IsSigned)
-                {
-                    request.Header.Signature = new byte[16]; // Request could be reused
-                    byte[] buffer = request.GetBytes();
-                    byte[] signature = SMB2Cryptography.CalculateSignature(m_signingKey, m_dialect, buffer, 0, buffer.Length);
-                    // [MS-SMB2] The first 16 bytes of the hash MUST be copied into the 16-byte signature field of the SMB2 Header.
-                    request.Header.Signature = ByteReader.ReadBytes(signature, 0, 16);
-                }
+                throw new Exception($"Not enough credits. Requested: {totalCreditCharge}, Available: {m_availableCredits}");
             }
-            TrySendCommand(m_clientSocket, request, encryptData ? m_encryptionKey : null);
-            if (!m_connectionSupportsMultiCredit)
+            m_availableCredits -= totalCreditCharge;
+
+            // 3. Request replenishment credits from the server
+            // Best practice: Put the credit request on the LAST command of the compound chain
+            var lastRequest = requests[requests.Count - 1];
+            if (m_availableCredits < DesiredCredits)
             {
-                m_messageID++;
+                lastRequest.Header.Credits += (ushort)(DesiredCredits - m_availableCredits);
             }
-            else
-            {
-                m_messageID += request.Header.CreditCharge;
-            }
+
+            // 4. Send the payload over the socket
+            TrySendCommands(m_clientSocket, requests, encryptData ? m_encryptionKey : null);
+
+            // 5. Correctly advance the global MessageID counter by the total sum of credit charges
+            if (increaseMessageId)
+                m_messageID += totalCreditCharge;
         }
 
         /// <remarks>SMB 3.1.1 only</remarks>
@@ -826,20 +833,34 @@ namespace SMBLibrary.Client
             }
         }
 
-        private void TrySendCommand(Socket socket, SMB2Command request, byte[] encryptionKey)
+        public ushort AvailableCredits
+        {
+            get
+            {
+                return m_connectionSupportsMultiCredit ? m_availableCredits : (ushort)(1);
+            }
+        }
+
+        public uint GetNextMessageId()
+        {
+            return m_messageID++;
+        }
+
+        private void TrySendCommands(Socket socket, List<SMB2Command> requests, byte[] encryptionKey)
         {
             SessionMessagePacket packet = new SessionMessagePacket();
             if (encryptionKey != null)
             {
-                byte[] requestBytes = request.GetBytes();
-                packet.Trailer = SMB2Cryptography.TransformMessage(encryptionKey, requestBytes, request.Header.SessionID);
+                byte[] requestBytes = SMB2Command.GetCommandChainBytes(requests, null, m_dialect);
+                packet.Trailer = SMB2Cryptography.TransformMessage(encryptionKey, requestBytes, m_sessionID);
             }
             else
             {
-                packet.Trailer = request.GetBytes();
-                if (m_preauthIntegrityHashValue != null && (request is NegotiateRequest || request is SessionSetupRequest))
+                packet.Trailer = SMB2Command.GetCommandChainBytes(requests, m_signingKey, m_dialect);
+                if (requests.Count == 1 && m_preauthIntegrityHashValue != null && (requests[0] is NegotiateRequest || requests[0] is SessionSetupRequest))
                 {
-                    m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, packet.Trailer));
+                    m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(
+                        HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, packet.Trailer));
                 }
             }
             TrySendPacket(socket, packet);

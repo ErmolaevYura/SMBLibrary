@@ -4,6 +4,7 @@
  * the GNU Lesser Public License as published by the Free Software Foundation,
  * either version 3 of the License, or (at your option) any later version.
  */
+using SMBLibrary.Server;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -177,8 +178,10 @@ namespace SMBLibrary.SMB2
                 command.WriteBytes(buffer, offset);
                 if (command.Header.IsSigned && signingKey != null)
                 {
+                    Array.Clear(buffer, offset + SMB2Header.SignatureOffset, SMB2Header.SignatureLength);
                     // [MS-SMB2] Any padding at the end of the message MUST be used in the hash computation.
                     byte[] signature = SMB2Cryptography.CalculateSignature(signingKey, dialect, buffer, offset, paddedLength);
+                    // [MS-SMB2] The first 16 bytes of the hash MUST be copied into the 16-byte signature field of the SMB2 Header.
                     ByteWriter.WriteBytes(buffer, offset + SMB2Header.SignatureOffset, signature, SMB2Header.SignatureLength);
                 }
                 offset += paddedLength;
