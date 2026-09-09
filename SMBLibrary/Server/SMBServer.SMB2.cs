@@ -247,7 +247,10 @@ namespace SMBLibrary.Server
 
             SessionMessagePacket packet = new SessionMessagePacket();
             SMB2Dialect smb2Dialect = (signingKey != null) ? ToSMB2Dialect(state.Dialect) : SMB2Dialect.SMB2xx;
-            packet.Trailer = SMB2Command.GetCommandChainBytes(responseChain, signingKey, smb2Dialect);
+            // The server does not (yet) negotiate SMB2_SIGNING_CAPABILITIES, so fall back to the same
+            // dialect-based default the client uses before SigningCapabilities negotiation applies.
+            SigningAlgorithm signingAlgorithm = SMB2Cryptography.GetDefaultSigningAlgorithm(smb2Dialect);
+            packet.Trailer = SMB2Command.GetCommandChainBytes(responseChain, signingKey, signingAlgorithm);
             state.SendQueue.Enqueue(packet);
             state.LogToServer(Severity.Verbose, "SMB2 response chain queued: Response count: {0}, First response: {1}, Packet length: {2}", responseChain.Count, responseChain[0].CommandName.ToString(), packet.Length);
         }

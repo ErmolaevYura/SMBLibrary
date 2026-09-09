@@ -66,8 +66,10 @@ namespace SMBLibrary.Client
             }
 
             DateTime time = DateTime.UtcNow;
-            byte[] clientChallenge = new byte[8];
-            new Random().NextBytes(clientChallenge);
+            // Feeds directly into the NTLMv2 proof/response (and the NTLMv1ExtendedSessionSecurity response) -
+            // a predictable, clock-seeded Random() here would undermine the same replay/precomputation
+            // protection the CSPRNG-based sessionKey generation below this method preserves.
+            byte[] clientChallenge = SecureRandom.GetBytes(8);
 
             AuthenticateMessage authenticateMessage = new AuthenticateMessage();
             // https://msdn.microsoft.com/en-us/library/cc236676.aspx
@@ -154,7 +156,7 @@ namespace SMBLibrary.Client
                     authenticateMessage.LmChallengeResponse = NTLMCryptography.ComputeLMv2Response(challengeMessage.ServerChallenge, clientChallenge, password, userName, challengeMessage.TargetName);
                     authenticateMessage.NtChallengeResponse = ByteUtils.Concatenate(ntProofStr, clientChallengeStructurePadded);
                 }
-                
+
                 byte[] responseKeyNT = NTLMCryptography.NTOWFv2(password, userName, domainName);
                 sessionBaseKey = new HMACMD5(responseKeyNT).ComputeHash(ntProofStr);
                 keyExchangeKey = sessionBaseKey;
@@ -165,8 +167,9 @@ namespace SMBLibrary.Client
             // https://msdn.microsoft.com/en-us/library/cc236676.aspx
             if ((challengeMessage.NegotiateFlags & NegotiateFlags.KeyExchange) > 0)
             {
-                sessionKey = new byte[16];
-                new Random().NextBytes(sessionKey);
+                // This becomes the actual NTLM session key (RC4-encrypted and sent as EncryptedRandomSessionKey) - 
+                // a non-cryptographic Random() is seeded from the clock and brute-forceable, so it must not be used here.
+                sessionKey = SecureRandom.GetBytes(16);
                 authenticateMessage.EncryptedRandomSessionKey = RC4.Encrypt(keyExchangeKey, sessionKey);
             }
             else

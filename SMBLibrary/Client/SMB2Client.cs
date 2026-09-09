@@ -1,5 +1,5 @@
 /* Copyright (C) 2017-2026 Tal Aloni <tal.aloni.il@gmail.com>. All rights reserved.
- * 
+ *
  * You can redistribute this program and/or modify it under the terms of
  * the GNU Lesser Public License as published by the Free Software Foundation,
  * either version 3 of the License, or (at your option) any later version.
@@ -47,6 +47,7 @@ namespace SMBLibrary.Client
         private EventWaitHandle m_sessionResponseEventHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
 
         private uint m_messageID = 0;
+        private readonly object m_messageIDLock = new object();
         private SMB2Dialect m_dialect;
         private bool m_signingRequired;
         private byte[] m_signingKey;
@@ -63,6 +64,9 @@ namespace SMBLibrary.Client
         private ushort m_availableCredits = 1;
         private bool m_connectionSupportsMultiCredit = false;
         private IAuthenticationClient m_authenticationClient;
+        private HashAlgorithm m_hashAlgorithm = HashAlgorithm.SHA512;
+        private CipherAlgorithm m_cipherAlgorithm = CipherAlgorithm.Aes128Ccm;
+        private SigningAlgorithm m_signingAlgorithm = SigningAlgorithm.AESCMAC;
 
         public SMB2Client() : this(DefaultResponseTimeoutInMilliseconds)
         {
@@ -201,7 +205,10 @@ namespace SMBLibrary.Client
                     m_connectionState.ReceiveBuffer.Dispose();
                 }
                 m_isConnected = false;
-                m_messageID = 0;
+                lock (m_messageIDLock)
+                {
+                    m_messageID = 0;
+                }
                 m_sessionID = 0;
                 m_availableCredits = 1;
                 m_connectionSupportsMultiCredit = false;
@@ -231,6 +238,10 @@ namespace SMBLibrary.Client
             if (response != null && response.Header.Status == NTStatus.STATUS_SUCCESS)
             {
                 m_dialect = response.DialectRevision;
+                if (m_dialect < SMB2Dialect.SMB311)
+                {
+                    m_signingAlgorithm = SMB2Cryptography.GetDefaultSigningAlgorithm(m_dialect);
+                }
                 // [MS-SMB2] 3.3.5.7 If Connection.Dialect is "3.1.1" and Session.IsAnonymous and Session.IsGuest
                 // are set to FALSE and the request is not signed or not encrypted, then the server MUST disconnect the connection.
                 m_signingRequired = (response.SecurityMode & SecurityMode.SigningRequired) > 0 ||
@@ -310,7 +321,19 @@ namespace SMBLibrary.Client
                         authenticationClient.InitializeSecurityContext(finalSessionSetupResponse.SecurityBuffer);
                     }
 
-                    m_sessionKey = authenticationClient.GetSessionKey();
+                    var baseSessionKey = authenticationClient.GetSessionKey();
+                    if (baseSessionKey == null)
+                    {
+                        // Report this the same way every other login failure on this path is reported (an
+                        // NTStatus return, not an exception) - callers such as ConnectAndLoginToDfsTarget only
+                        // wrap Connect() in try/catch and expect Login() failures to come back as a status code.
+                        // Also leave the client in a well-defined "not logged in" state - otherwise m_isLoggedIn
+                        // (already set true above) would stay true with m_signingKey still null, and the next
+                        // inbound response would call VerifySignature with a null signing key.
+                        m_isLoggedIn = false;
+                        return NTStatus.STATUS_LOGON_FAILURE;
+                    }
+
                     m_authenticationClient = authenticationClient;
                     SessionFlags sessionFlags = finalSessionSetupResponse.SessionFlags;
                     if ((sessionFlags & SessionFlags.IsGuest) > 0)
@@ -321,14 +344,25 @@ namespace SMBLibrary.Client
                     }
                     else
                     {
-                        m_signingKey = SMB2Cryptography.GenerateSigningKey(m_sessionKey, m_dialect, m_preauthIntegrityHashValue);
+                        // Signing always uses a 128-bit key ([MS-SMB2] 3.1.4.2 KDF input), regardless of dialect
+                        // or the negotiated cipher's key length - unlike the session key used for encryption below.
+                        m_signingKey = SMB2Cryptography.GenerateSigningKey(Truncate16(baseSessionKey), m_dialect, m_preauthIntegrityHashValue);
                     }
 
                     if (m_dialect >= SMB2Dialect.SMB300)
                     {
+                        // Only truncate to 128 bits when the negotiated cipher itself is 128-bit; a 256-bit
+                        // cipher (SMB 3.1.1 AES-256-GCM/CCM) needs the full-length session key here.
+                        m_sessionKey = (SMB2CipherProvider.GetKeyLengthInBits(m_cipherAlgorithm) == 128) ? Truncate16(baseSessionKey) : baseSessionKey;
                         m_encryptSessionData = (sessionFlags & SessionFlags.EncryptData) > 0;
-                        m_encryptionKey = SMB2Cryptography.GenerateClientEncryptionKey(m_sessionKey, m_dialect, m_preauthIntegrityHashValue);
-                        m_decryptionKey = SMB2Cryptography.GenerateClientDecryptionKey(m_sessionKey, m_dialect, m_preauthIntegrityHashValue);
+                        m_encryptionKey = SMB2Cryptography.GenerateClientEncryptionKey(m_sessionKey, m_dialect, m_preauthIntegrityHashValue, m_cipherAlgorithm);
+                        m_decryptionKey = SMB2Cryptography.GenerateClientDecryptionKey(m_sessionKey, m_dialect, m_preauthIntegrityHashValue, m_cipherAlgorithm);
+                    }
+                    else
+                    {
+                        // Pre-3.0 dialects have no cipher negotiation; the session key here is only ever used
+                        // for 128-bit-keyed purposes, so it's always truncated.
+                        m_sessionKey = Truncate16(baseSessionKey);
                     }
                 }
                 return response.Header.Status;
@@ -525,9 +559,24 @@ namespace SMBLibrary.Client
                 bool isEncrypted = m_dialect >= SMB2Dialect.SMB300 && SMB2TransformHeader.IsTransformHeader(packet.Trailer, 0);
                 if (isEncrypted)
                 {
-                    SMB2TransformHeader transformHeader = new SMB2TransformHeader(packet.Trailer, 0);
-                    byte[] encryptedMessage = ByteReader.ReadBytes(packet.Trailer, SMB2TransformHeader.Length, (int)transformHeader.OriginalMessageSize);
-                    messageBytes = SMB2Cryptography.DecryptMessage(m_decryptionKey, transformHeader, encryptedMessage);
+                    // A corrupted/truncated encrypted frame, or a cipher/key mismatch from a race during
+                    // renegotiation, throws CryptographicException/ArgumentException here - handle it the same
+                    // way the ReadResponseChain failure below is handled (log, close, dispose) instead of
+                    // letting it escape the receive callback unhandled.
+                    try
+                    {
+                        SMB2TransformHeader transformHeader = new SMB2TransformHeader(packet.Trailer, 0);
+                        byte[] encryptedMessage = ByteReader.ReadBytes(packet.Trailer, SMB2TransformHeader.Length, (int)transformHeader.OriginalMessageSize);
+                        messageBytes = SMB2Cryptography.DecryptMessage(m_decryptionKey, transformHeader, encryptedMessage, m_cipherAlgorithm);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("Failed to decrypt SMB2 response: " + ex.Message);
+                        state.ClientSocket.Close();
+                        m_isConnected = false;
+                        state.ReceiveBuffer.Dispose();
+                        return;
+                    }
                 }
                 else
                 {
@@ -559,7 +608,10 @@ namespace SMBLibrary.Client
                     {
                         // Preauth integrity hashing covers the whole received message, not a sub-range - NegotiateResponse / SessionSetupRsponse
                         // are never chained with other commands in practice, so hashing the entries frame once here matches the original behavior.
-                        m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, messageBytes));
+                        // Use m_hashAlgorithm (same field the send-path hash update below uses), not a hardcoded
+                        // SHA512, so the two hash updates can't diverge if a future dialect ever negotiates a
+                        // different pre-auth integrity hash algorithm (MS-SMB2 only defines SHA-512 today).
+                        m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(m_hashAlgorithm, ByteUtils.Concatenate(m_preauthIntegrityHashValue, messageBytes));
                     }
                 }
 
@@ -570,25 +622,51 @@ namespace SMBLibrary.Client
                 SMB2Command lastCommand = commands[commands.Count - 1];
                 m_availableCredits += lastCommand.Header.Credits;
 
-                if (m_transport == SMBTransportType.DirectTCPTransport && lastCommand is NegotiateResponse negotiateResponse)
+                if (lastCommand is NegotiateResponse negotiateResponse)
                 {
-                    m_connectionSupportsMultiCredit = (negotiateResponse.Capabilities & Capabilities.LargeMTU) > 0;
-                    if (m_connectionSupportsMultiCredit)
+                    if (m_transport == SMBTransportType.DirectTCPTransport)
                     {
-                        // [MS-SMB2] 3.2.5.1 Receiving Any Message - If the message size received exceeds Connection.MaxTransactSize, the client SHOULD disconnect the connection.
-                        // Note: Windows clients do not enforce the MaxTransactSize value.
-                        // We use a value that we have observed to work well with both Microsoft and non-Microsoft servers.
-                        // see https://github.com/TalAloni/SMBLibrary/issues/239
-                        int serverMaxTransactSize = (int)Math.Max(negotiateResponse.MaxTransactSize, negotiateResponse.MaxReadSize);
-                        int maxPacketSize = SessionPacket.HeaderLength + (int)Math.Min(serverMaxTransactSize, ClientMaxTransactSize) + 256;
-                        if (maxPacketSize > state.ReceiveBuffer.Buffer.Length)
+                        m_connectionSupportsMultiCredit = (negotiateResponse.Capabilities & Capabilities.LargeMTU) > 0;
+                        if (m_connectionSupportsMultiCredit)
                         {
-                            state.ReceiveBuffer.IncreaseBufferSize(maxPacketSize);
+                            // [MS-SMB2] 3.2.5.1 Receiving Any Message - If the message size received exceeds Connection.MaxTransactSize, the client SHOULD disconnect the connection.
+                            // Note: Windows clients do not enforce the MaxTransactSize value.
+                            // We use a value that we have observed to work well with both Microsoft and non-Microsoft servers.
+                            // see https://github.com/TalAloni/SMBLibrary/issues/239
+                            int serverMaxTransactSize = (int)Math.Max(negotiateResponse.MaxTransactSize, negotiateResponse.MaxReadSize);
+                            int maxPacketSize = SessionPacket.HeaderLength + (int)Math.Min(serverMaxTransactSize, ClientMaxTransactSize) + 256;
+                            if (maxPacketSize > state.ReceiveBuffer.Buffer.Length)
+                            {
+                                state.ReceiveBuffer.IncreaseBufferSize(maxPacketSize);
+                            }
+                        }
+                    }
+
+                    foreach (var negotiateContex in negotiateResponse.NegotiateContextList)
+                    {
+                        if (negotiateContex is PreAuthIntegrityCapabilities)
+                        {
+                            m_hashAlgorithm = FirstOrDefault((negotiateContex as PreAuthIntegrityCapabilities).HashAlgorithms, HashAlgorithm.SHA512);
+                        }
+                        else if (negotiateContex is EncryptionCapabilities)
+                        {
+                            m_cipherAlgorithm = FirstOrDefault((negotiateContex as EncryptionCapabilities).Ciphers, CipherAlgorithm.Aes128Ccm);
+                        }
+                        else if (negotiateContex is SigningCapabilities)
+                        {
+                            m_signingAlgorithm = FirstOrDefault((negotiateContex as SigningCapabilities).Signings, SigningAlgorithm.AESCMAC);
                         }
                     }
                 }
 
+                // [MS-SMB2] 3.2.5.1.3 If signature verification fails, the client MUST discard the received
+                // message (the whole compound frame, not just the rest of the chain). So verify every
+                // chained command's signature first, in one pass, and only enqueue any of them - in a
+                // second pass - once the whole frame is known to be valid. Enqueueing each command as its
+                // own signature verifies (as a single-pass loop would) delivers a partial, tampered
+                // compound reply to callers before the loop ever reaches the corrupted command.
                 int commandOffset = 0;
+                var commandsToEnqueue = new List<SMB2Command>();
                 foreach (SMB2Command command in commands)
                 {
                     int commandLength = (command.Header.NextCommand != 0) ? (int)command.Header.NextCommand : (messageBytes.Length - commandOffset);
@@ -601,25 +679,34 @@ namespace SMBLibrary.Client
                         bool isInterimResponse = ((command.Header.Flags & SMB2PacketHeaderFlags.AsyncCommand) != 0) && command.Header.Status == NTStatus.STATUS_PENDING;
                         bool shouldBeSigned = m_isLoggedIn && m_signingRequired && !isEncrypted && !isInterimResponse;
 
-                        // [MS-SMB2] 3.2.5.1.3 If signature verification fails, the client MUST discard the received message. The client MAY also choose to disconnect the connection
-                        // Each chained message is sined independently over its own segment, so verify against that segment (commandOffset...commandLength), not the whole frame.
+                        // Each chained message is signed independently over its own segment, so verify against
+                        // that segment (commandOffset...commandLength), not the whole frame.
                         if (shouldBeSigned)
                         {
                             byte[] commandBytes = ByteReader.ReadBytes(messageBytes, commandOffset, commandLength);
-                            if (!SMB2Cryptography.VerifySignature(commandBytes, m_dialect, m_signingKey))
+                            if (!SMB2Cryptography.VerifySignature(commandBytes, m_signingAlgorithm, m_signingKey))
                             {
                                 Log("Invalid SMB2 response signature");
                                 return;
                             }
                         }
 
-                        lock (m_incomingQueueLock)
-                        {
-                            m_incomingQueue.Add(command);
-                            m_incomingQueueEventHandle.Set();
-                        }
+                        commandsToEnqueue.Add(command);
+                    }
 
-                        commandOffset += commandLength;
+                    // Must advance regardless of whether the command above was kept or discarded (per
+                    // [MS-SMB2] 3.2.5.1.2) - this walks byte offsets in the raw compound frame, not the
+                    // list of commands the client chose to process. Skipping it here would desync every
+                    // subsequent chained command's offset (and therefore its signature verification).
+                    commandOffset += commandLength;
+                }
+
+                if (commandsToEnqueue.Count > 0)
+                {
+                    lock (m_incomingQueueLock)
+                    {
+                        m_incomingQueue.AddRange(commandsToEnqueue);
+                        m_incomingQueueEventHandle.Set();
                     }
                 }
             }
@@ -706,7 +793,10 @@ namespace SMBLibrary.Client
 
         internal void TrySendCommand(SMB2Command request, bool encryptData)
         {
-            request.Header.MessageID = m_messageID;
+            lock (m_messageIDLock)
+            {
+                request.Header.MessageID = m_messageID;
+            }
             TrySendCommands(new List<SMB2Command>(){ request }, encryptData);
         }
 
@@ -715,8 +805,27 @@ namespace SMBLibrary.Client
             if (requests == null || requests.Count == 0)
                 return;
 
-            ushort totalCreditCharge = 0;
-            // 1. Validate and calculate credit charge for EVERY command in the batch
+            // 1. Validate the ENTIRE batch before mutating any request's headers - a caller that catches
+            // the exception below may reuse the same request objects for a retry (see "Request could be
+            // reused" elsewhere), so a batch that gets rejected must come back with every request
+            // untouched, not partially mutated by whichever earlier requests were processed before the
+            // one that failed.
+            if (!m_connectionSupportsMultiCredit)
+            {
+                foreach (var request in requests)
+                {
+                    if (request.Header.CreditCharge > 1)
+                    {
+                        throw new Exception("Attempted to read or write more data than allowed for this connection");
+                    }
+                }
+            }
+
+            // uint, not ushort: summing many multi-credit requests' CreditCharge (each up to ushort.MaxValue)
+            // in a batch can exceed ushort range - a ushort accumulator would silently wrap, making the
+            // credit-availability check below pass incorrectly and under-report what's actually consumed.
+            uint totalCreditCharge = 0;
+            // 2. Now that validation passed, calculate credit charge and apply header mutations for every command.
             foreach (var request in requests)
             {
                 // [MS-SMB2] If the client encrypts the message [..] then the client MUST set the Signature field of the SMB2 header to zero
@@ -729,10 +838,6 @@ namespace SMBLibrary.Client
 
                 if (!m_connectionSupportsMultiCredit)
                 {
-                    if (request.Header.CreditCharge > 1)
-                    {
-                        throw new Exception("Attempted to read or write more data than allowed for this connection");
-                    }
                     // [MS-SMB2] 3.2.4.1.5 If [..] Connection.SupportsMultiCredit is FALSE, CreditCharge SHOULD be set to 0.
                     request.Header.CreditCharge = 0;
                     request.Header.Credits = 1;
@@ -752,14 +857,16 @@ namespace SMBLibrary.Client
                 }
             }
 
-            // 2. Check internal credit window availability for the ENTIRE batch
+            // 3. Check internal credit window availability for the ENTIRE batch
             if (m_availableCredits < totalCreditCharge)
             {
                 throw new Exception($"Not enough credits. Requested: {totalCreditCharge}, Available: {m_availableCredits}");
             }
-            m_availableCredits -= totalCreditCharge;
+            // Safe cast: the check above already guarantees totalCreditCharge <= m_availableCredits, and
+            // m_availableCredits is a ushort, so totalCreditCharge is within ushort range here.
+            m_availableCredits -= (ushort)totalCreditCharge;
 
-            // 3. Request replenishment credits from the server
+            // 4. Request replenishment credits from the server
             // Best practice: Put the credit request on the LAST command of the compound chain
             var lastRequest = requests[requests.Count - 1];
             if (m_availableCredits < DesiredCredits)
@@ -767,12 +874,17 @@ namespace SMBLibrary.Client
                 lastRequest.Header.Credits += (ushort)(DesiredCredits - m_availableCredits);
             }
 
-            // 4. Send the payload over the socket
+            // 5. Send the payload over the socket
             TrySendCommands(m_clientSocket, requests, encryptData ? m_encryptionKey : null);
 
-            // 5. Correctly advance the global MessageID counter by the total sum of credit charges
+            // 6. Correctly advance the global MessageID counter by the total sum of credit charges
             if (increaseMessageId)
-                m_messageID += totalCreditCharge;
+            {
+                lock (m_messageIDLock)
+                {
+                    m_messageID += totalCreditCharge;
+                }
+            }
         }
 
         /// <remarks>SMB 3.1.1 only</remarks>
@@ -780,16 +892,28 @@ namespace SMBLibrary.Client
         {
             PreAuthIntegrityCapabilities preAuthIntegrityCapabilities = new PreAuthIntegrityCapabilities();
             preAuthIntegrityCapabilities.HashAlgorithms.Add(HashAlgorithm.SHA512);
-            preAuthIntegrityCapabilities.Salt = new byte[32];
-            new Random().NextBytes(preAuthIntegrityCapabilities.Salt);
+            // The salt seeds the SMB 3.1.1 pre-auth integrity hash that detects negotiate downgrade/tampering -
+            // a predictable (clock-seeded) salt would weaken that protection, so it needs a CSPRNG, not Random.
+            preAuthIntegrityCapabilities.Salt = SecureRandom.GetBytes(32);
 
             EncryptionCapabilities encryptionCapabilities = new EncryptionCapabilities();
+            // Listed in order of preference; the server picks the first entry it also supports.
+            encryptionCapabilities.Ciphers.Add(CipherAlgorithm.Aes256Gcm);
+            encryptionCapabilities.Ciphers.Add(CipherAlgorithm.Aes128Gcm);
+            encryptionCapabilities.Ciphers.Add(CipherAlgorithm.Aes256Ccm);
             encryptionCapabilities.Ciphers.Add(CipherAlgorithm.Aes128Ccm);
+
+            SigningCapabilities signingCapabilities = new SigningCapabilities();
+            // Listed in order of preference; the server picks the first entry it also supports.
+            signingCapabilities.Signings.Add(SigningAlgorithm.AESGMAC);
+            signingCapabilities.Signings.Add(SigningAlgorithm.AESCMAC);
+            signingCapabilities.Signings.Add(SigningAlgorithm.HMACSHA256);
 
             return new List<NegotiateContext>()
             {
                 preAuthIntegrityCapabilities,
-                encryptionCapabilities
+                encryptionCapabilities,
+                signingCapabilities
             };
         }
 
@@ -837,13 +961,16 @@ namespace SMBLibrary.Client
         {
             get
             {
-                return m_connectionSupportsMultiCredit ? m_availableCredits : (ushort)(1);
+                return m_availableCredits;
             }
         }
 
         public uint GetNextMessageId()
         {
-            return m_messageID++;
+            lock (m_messageIDLock)
+            {
+                return m_messageID++;
+            }
         }
 
         private void TrySendCommands(Socket socket, List<SMB2Command> requests, byte[] encryptionKey)
@@ -851,16 +978,16 @@ namespace SMBLibrary.Client
             SessionMessagePacket packet = new SessionMessagePacket();
             if (encryptionKey != null)
             {
-                byte[] requestBytes = SMB2Command.GetCommandChainBytes(requests, null, m_dialect);
-                packet.Trailer = SMB2Cryptography.TransformMessage(encryptionKey, requestBytes, m_sessionID);
+                byte[] requestBytes = SMB2Command.GetCommandChainBytes(requests, null, m_signingAlgorithm);
+                packet.Trailer = SMB2Cryptography.TransformMessage(encryptionKey, requestBytes, m_sessionID, m_cipherAlgorithm);
             }
             else
             {
-                packet.Trailer = SMB2Command.GetCommandChainBytes(requests, m_signingKey, m_dialect);
+                packet.Trailer = SMB2Command.GetCommandChainBytes(requests, m_signingKey, m_signingAlgorithm);
                 if (requests.Count == 1 && m_preauthIntegrityHashValue != null && (requests[0] is NegotiateRequest || requests[0] is SessionSetupRequest))
                 {
                     m_preauthIntegrityHashValue = SMB2Cryptography.ComputeHash(
-                        HashAlgorithm.SHA512, ByteUtils.Concatenate(m_preauthIntegrityHashValue, packet.Trailer));
+                        m_hashAlgorithm, ByteUtils.Concatenate(m_preauthIntegrityHashValue, packet.Trailer));
                 }
             }
             TrySendPacket(socket, packet);
@@ -886,6 +1013,26 @@ namespace SMBLibrary.Client
         private static string CreateSpn(string serverAddress)
         {
             return $"cifs/{serverAddress}";
+        }
+
+        // Enumerable .FirstOrDefault() is a .NET 6+ only available, but this project also
+        // targets net20/net40/netstandard2.0 (Platform=Net) where it doen't exist - use this instead.
+        private static T FirstOrDefault<T>(IEnumerable<T> source, T defaultValue)
+        {
+            foreach (T item in source)
+            {
+                return item;
+            }
+            return defaultValue;
+        }
+
+        // Copies (or zero-pads) the input array to a new 16-byte array. Used wherever a key derivation input must be
+        // exactly 128 bits regardless of the actual session key length (e.g. Kerberos AES256's 32-byte key).
+        private static byte[] Truncate16(byte[] input)
+        {
+            byte[] truncated = new byte[16];
+            Array.Copy(input, truncated, Math.Min(input.Length, 16));
+            return truncated;
         }
 
         /// <summary>

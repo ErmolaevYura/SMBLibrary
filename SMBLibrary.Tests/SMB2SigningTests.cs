@@ -26,7 +26,7 @@ namespace SMBLibrary.Tests
 
             ByteWriter.WriteBytes(message, 48, new byte[16]);
 
-            byte[] signature = SMB2Cryptography.CalculateSignature(exportedSessionKey, SMB2Dialect.SMB202, message, 0, message.Length);
+            byte[] signature = SMB2Cryptography.CalculateSignature(exportedSessionKey, SigningAlgorithm.HMACSHA256, message, 0, message.Length);
             byte[] expected = new byte[] { 0xfb, 0xd2, 0x84, 0x34, 0x03, 0x24, 0xc6, 0x2f, 0xbe, 0xbb, 0x65, 0xdd, 0x10, 0x51, 0xf3, 0xae };
             Assert.IsTrue(ByteUtils.AreByteArraysEqual(signature, expected));
         }
@@ -44,7 +44,7 @@ namespace SMBLibrary.Tests
 
             ByteWriter.WriteBytes(message, 48, new byte[16]);
 
-            byte[] signature = SMB2Cryptography.CalculateSignature(exportedSessionKey, SMB2Dialect.SMB210, message, 0, message.Length);
+            byte[] signature = SMB2Cryptography.CalculateSignature(exportedSessionKey, SigningAlgorithm.HMACSHA256, message, 0, message.Length);
             byte[] expected = new byte[] { 0xa1, 0x64, 0xff, 0xe5, 0x3d, 0x68, 0x11, 0x98, 0x1f, 0x38, 0x67, 0x72, 0xe3, 0x87, 0xe0, 0x6f };
             Assert.IsTrue(ByteUtils.AreByteArraysEqual(signature, expected));
         }
@@ -53,7 +53,7 @@ namespace SMBLibrary.Tests
         public void TestSMB300SignatureCalculation()
         {
             byte[] exportedSessionKey = new byte[] { 0x35, 0x40, 0x24, 0xCB, 0xCA, 0x4F, 0x94, 0xAA, 0x51, 0xD4, 0x03, 0x3E, 0x6E, 0x9B, 0x2F, 0x98 };
-            byte[] signingKey = SMB2Cryptography.GenerateSigningKey(exportedSessionKey, SMB2Dialect.SMB300, null);
+            byte[] signingKey = SMB2Cryptography.GenerateSigningKey(exportedSessionKey, SMB2Dialect.SMB302, null);
 
             byte[] message = new byte[]{ 0xFE, 0x53, 0x4D, 0x42, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
                                          0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -63,7 +63,7 @@ namespace SMBLibrary.Tests
 
             ByteWriter.WriteBytes(message, 48, new byte[16]);
 
-            byte[] signature = SMB2Cryptography.CalculateSignature(signingKey, SMB2Dialect.SMB300, message, 0, message.Length);
+            byte[] signature = SMB2Cryptography.CalculateSignature(signingKey, SigningAlgorithm.AESCMAC, message, 0, message.Length);
             byte[] expected = new byte[] { 0x73, 0xF2, 0xCC, 0x56, 0x09, 0x3E, 0xD2, 0xB5, 0xD7, 0x10, 0x66, 0x6C, 0xE4, 0x28, 0x2D, 0xD1 };
             Assert.IsTrue(ByteUtils.AreByteArraysEqual(signature, expected));
         }

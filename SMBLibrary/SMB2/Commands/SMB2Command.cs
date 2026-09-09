@@ -1,5 +1,5 @@
 /* Copyright (C) 2017-2021 Tal Aloni <tal.aloni.il@gmail.com>. All rights reserved.
- * 
+ *
  * You can redistribute this program and/or modify it under the terms of
  * the GNU Lesser Public License as published by the Free Software Foundation,
  * either version 3 of the License, or (at your option) any later version.
@@ -133,16 +133,16 @@ namespace SMBLibrary.SMB2
 
         public static byte[] GetCommandChainBytes(List<SMB2Command> commands)
         {
-            return GetCommandChainBytes(commands, null, SMB2Dialect.SMB2xx);
+            return GetCommandChainBytes(commands, null, SigningAlgorithm.HMACSHA256);
         }
 
         /// <param name="signingKey">
         /// Message will be signed using this key if (not null and) SMB2_FLAGS_SIGNED is set.
         /// </param>
-        /// <param name="dialect">
+        /// <param name="signingAlgorithm">
         /// Used for signature calculation when applicable.
         /// </param>
-        public static byte[] GetCommandChainBytes(List<SMB2Command> commands, byte[] signingKey, SMB2Dialect dialect)
+        public static byte[] GetCommandChainBytes(List<SMB2Command> commands, byte[] signingKey, SigningAlgorithm signingAlgorithm)
         {
             int totalLength = 0;
             for (int index = 0; index < commands.Count; index++)
@@ -180,7 +180,7 @@ namespace SMBLibrary.SMB2
                 {
                     Array.Clear(buffer, offset + SMB2Header.SignatureOffset, SMB2Header.SignatureLength);
                     // [MS-SMB2] Any padding at the end of the message MUST be used in the hash computation.
-                    byte[] signature = SMB2Cryptography.CalculateSignature(signingKey, dialect, buffer, offset, paddedLength);
+                    byte[] signature = SMB2Cryptography.CalculateSignature(signingKey, signingAlgorithm, buffer, offset, paddedLength);
                     // [MS-SMB2] The first 16 bytes of the hash MUST be copied into the 16-byte signature field of the SMB2 Header.
                     ByteWriter.WriteBytes(buffer, offset + SMB2Header.SignatureOffset, signature, SMB2Header.SignatureLength);
                 }
@@ -433,7 +433,7 @@ namespace SMBLibrary.SMB2
                         {
                             NTStatus status = (NTStatus)LittleEndianConverter.ToUInt32(buffer, offset + 8);
                             if (status == NTStatus.STATUS_SUCCESS ||
-                                status == NTStatus.STATUS_NOTIFY_CLEANUP || 
+                                status == NTStatus.STATUS_NOTIFY_CLEANUP ||
                                 status == NTStatus.STATUS_NOTIFY_ENUM_DIR)
                             {
                                 return new ChangeNotifyResponse(buffer, offset);

@@ -1,5 +1,5 @@
 /* Copyright (C) 2017-2024 Tal Aloni <tal.aloni.il@gmail.com>. All rights reserved.
- * 
+ *
  * You can redistribute this program and/or modify it under the terms of
  * the GNU Lesser Public License as published by the Free Software Foundation,
  * either version 3 of the License, or (at your option) any later version.
@@ -72,6 +72,8 @@ namespace SMBLibrary.SMB2
                     return new PreAuthIntegrityCapabilities(buffer, offset);
                 case NegotiateContextType.SMB2_ENCRYPTION_CAPABILITIES:
                     return new EncryptionCapabilities(buffer, offset);
+                case NegotiateContextType.SMB2_SIGNING_CAPABILITIES:
+                    return new SigningCapabilities(buffer, offset);
                 default:
                     return new NegotiateContext(buffer, offset);
             }

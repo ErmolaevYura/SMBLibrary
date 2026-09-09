@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+    <Platforms>AnyCPU;Net</Platforms>
     <AssemblyName>SMBLibrary.Adapters</AssemblyName>
     <Version>1.5.7</Version>
     <NoWarn>1573;1591</NoWarn>
@@ -13,6 +13,14 @@
     <PackageProjectUrl>https://github.com/TalAloni/SMBLibrary</PackageProjectUrl>
     <RepositoryUrl>https://github.com/TalAloni/SMBLibrary</RepositoryUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)' == 'Net'">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+		<TargetFrameworks>net20;net40;netstandard2.0</TargetFrameworks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' != 'Net'">
+    <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
 
   <ItemGroup>

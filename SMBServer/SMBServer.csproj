@@ -1,13 +1,22 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
 
   <PropertyGroup>
+    <Platforms>AnyCPU;Net</Platforms>
     <OutputType>WinExe</OutputType>
-    <TargetFrameworks>net20;net40;netcoreapp3.1</TargetFrameworks>
     <Copyright>Copyright © Tal Aloni 2014-2026</Copyright>
     <AssemblyName>SMBServer</AssemblyName>
     <Version>1.5.7</Version>
     <RootNamespace>SMBServer</RootNamespace>
-    <UseWindowsForms>true</UseWindowsForms>
+    <UseWindowsForms>True</UseWindowsForms>
+    <UseWPF>False</UseWPF>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Platform)' == 'Net'">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <TargetFrameworks>net20;net40;netcoreapp3.1</TargetFrameworks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)' != 'Net'">
+    <TargetFrameworks>net8.0-windows</TargetFrameworks>
   </PropertyGroup>
 
   <ItemGroup Condition=" '$(TargetFramework)' == 'net20' ">
